@@ -1,3 +1,5 @@
+# main.py (Updated)
+import re
 import asyncio
 from typing import Dict, List
 from fastapi import FastAPI, Request, HTTPException
@@ -5,16 +7,24 @@ from fastapi.responses import JSONResponse, Response
 import httpx
 import logging
 from datetime import datetime
-from fastapi.responses import JSONResponse
+from collections import defaultdict
+
 from owasp_rules import OWASP_RULES
-from regex_rules import check_regex_rules, detect_email
+from regex_rules import check_regex_rules
 from incident_logger import log_incident, get_incidents, mark_incident_handled
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# Admin key (demo)
+# Admin key (demo) - Consider using an environment variable for production
 ADMIN_KEY = "supersecretadminkey"
+
+# Example block rules (add your own)
+BLOCK_RULES = [
+    (r"<script.*?>.*?</script>", "XSS Script Tag"),
+    (r"select.*from.*", "SQL Injection Attempt"),
+    (r"union.*select", "SQL Injection Attempt"),
+]
 
 # Route map - map path prefixes to backend base URLs
 ROUTE_MAP = {
@@ -41,14 +51,12 @@ def resolve_backend(path: str) -> str:
     return DEFAULT_BACKEND
 
 # -------------------- Middleware --------------------
-from fastapi.responses import JSONResponse
-
 @app.middleware("http")
 async def payload_inspection_middleware(request: Request, call_next):
     path = request.url.path
 
-    # Skip internal endpoints
-    if path.startswith("/api/blocked-requests") or path.startswith("/health") or path.startswith("/admin"):
+    # Skip internal endpoints to prevent loops
+    if path.startswith("/api/") or path.startswith("/health") or path.startswith("/admin"):
         return await call_next(request)
 
     try:
@@ -62,23 +70,14 @@ async def payload_inspection_middleware(request: Request, call_next):
 
     client_ip = request.client.host if request.client else "unknown"
 
-    # 🔹 Check against malicious patterns
+    # 🔹 Check against basic malicious patterns
     for pattern, description in BLOCK_RULES:
         if re.search(pattern, full_payload, re.IGNORECASE):
             log_incident(client_ip, full_payload, description)
-            # ❌ Instead of proxying → return a clear blocked response
             return JSONResponse(
                 status_code=403,
                 content={"detail": f"Blocked by WAF: {description}"}
             )
-
-    # If no rule matched → forward request as usual
-    backend_base = resolve_backend(request.url.path)
-    target = backend_base.rstrip("/") + request.url.path
-    ...
-
-    # ... keep the rest of your inspection + forwarding logic below ...
-
 
     # OWASP rules
     for rule_name, rule_fn in OWASP_RULES.items():
@@ -99,7 +98,7 @@ async def payload_inspection_middleware(request: Request, call_next):
             log_incident(client_ip, full_payload, r)
         return JSONResponse(status_code=403, content={"detail": f"Blocked by Regex rule(s): {', '.join(triggered)}"})
 
-    # Forward to appropriate backend
+    # Forward to appropriate backend if no rule matched
     backend_base = resolve_backend(request.url.path)
     target = backend_base.rstrip("/") + request.url.path
     if request.url.query:
@@ -143,31 +142,38 @@ def admin_handle_incident(incident_id: int, key: str):
         return {"message": f"Incident {incident_id} marked as handled"}
     raise HTTPException(status_code=404, detail="Incident not found")
 
-# -------------------- New endpoint for frontend chart --------------------
+# -------------------- Frontend and External Tool Endpoints --------------------
 @app.get("/api/blocked-requests")
 def blocked_requests():
     """
-    Return blocked request counts grouped by minute.
-    Example response:
-    [
-      {"time": "14:00", "blocked": 5},
-      {"time": "14:01", "blocked": 2}
-    ]
+    Return blocked request counts grouped by 5-minute intervals for the frontend chart.
     """
     incidents = get_incidents()
-    counts: Dict[str, int] = {}
+    buckets = defaultdict(int)
 
     for inc in incidents:
-        ts = inc.get("timestamp")
         try:
-            dt = datetime.fromisoformat(ts)
-            time_label = dt.strftime("%H:%M")
-        except Exception:
-            time_label = "unknown"
+            dt = datetime.fromisoformat(inc["timestamp"])
+            minute = (dt.minute // 5) * 5
+            time_key = f"{dt.hour:02d}:{minute:02d}"
+            buckets[time_key] += 1
+        except (ValueError, KeyError):
+            continue
 
-        counts[time_label] = counts.get(time_label, 0) + 1
+    sorted_buckets = sorted(buckets.items())
+    return [{"time": t, "blocked": c} for t, c in sorted_buckets]
 
-    return [{"time": t, "blocked": counts[t]} for t in sorted(counts.keys())]
+@app.post("/api/incidents")
+def receive_incident(data: dict, key: str):
+    """
+    Endpoint for external tools like Suricata to submit new incidents.
+    """
+    admin_auth(key)
+    ip = data.get("ip", "unknown")
+    payload = data.get("payload", "")
+    rule = data.get("rule", "external_alert")
+    log_incident(ip, payload, rule)
+    return {"status": "incident logged"}
 
 # -------------------- Health check --------------------
 @app.get("/health")
@@ -177,6 +183,3 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-
