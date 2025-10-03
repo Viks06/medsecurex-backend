@@ -143,25 +143,44 @@ def admin_handle_incident(incident_id: int, key: str):
     raise HTTPException(status_code=404, detail="Incident not found")
 
 # -------------------- Frontend and External Tool Endpoints --------------------
+# Add these imports to the top of your main.py file
+from datetime import datetime
+from collections import defaultdict
+
+# ... (rest of your existing code) ...
+
+# -------------------- Frontend API Endpoints --------------------
 @app.get("/api/blocked-requests")
 def blocked_requests():
     """
-    Return blocked request counts grouped by 5-minute intervals for the frontend chart.
+    Gets all incidents, groups them by 5-minute intervals, and
+    returns the data in the format required by the frontend chart.
     """
     incidents = get_incidents()
     buckets = defaultdict(int)
 
     for inc in incidents:
         try:
+            # Parse the timestamp from the incident data
             dt = datetime.fromisoformat(inc["timestamp"])
+            
+            # Round the minute down to the nearest 5
             minute = (dt.minute // 5) * 5
             time_key = f"{dt.hour:02d}:{minute:02d}"
+            
+            # Increment the count for that time bucket
             buckets[time_key] += 1
         except (ValueError, KeyError):
+            # Skip any malformed incidents
             continue
 
+    # Sort the results by time
     sorted_buckets = sorted(buckets.items())
+    
+    # Format into the final JSON array
     return [{"time": t, "blocked": c} for t, c in sorted_buckets]
+
+# ... (rest of your existing endpoints) ...
 
 @app.post("/api/incidents")
 def receive_incident(data: dict, key: str):
@@ -183,3 +202,4 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
