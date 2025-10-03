@@ -43,6 +43,12 @@ def resolve_backend(path: str) -> str:
 # -------------------- Middleware --------------------
 @app.middleware("http")
 async def payload_inspection_middleware(request: Request, call_next):
+    path = request.url.path
+
+    # Skip inspection for internal endpoints
+    if path.startswith("/api/blocked-requests") or path.startswith("/health") or path.startswith("/admin"):
+        return await call_next(request)
+
     try:
         body_bytes = await request.body()
     except Exception:
@@ -57,6 +63,9 @@ async def payload_inspection_middleware(request: Request, call_next):
     full_payload = payload_text + ("?" + qs if qs else "")
 
     client_ip = request.client.host if request.client else "unknown"
+
+    # ... keep the rest of your inspection + forwarding logic below ...
+
 
     # OWASP rules
     for rule_name, rule_fn in OWASP_RULES.items():
@@ -155,4 +164,5 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
 
