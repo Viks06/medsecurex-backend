@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse, Response
 import httpx
 import logging
 from datetime import datetime
-
+from fastapi.responses import JSONResponse
 from owasp_rules import OWASP_RULES
 from regex_rules import check_regex_rules, detect_email
 from incident_logger import log_incident, get_incidents, mark_incident_handled
@@ -41,11 +41,13 @@ def resolve_backend(path: str) -> str:
     return DEFAULT_BACKEND
 
 # -------------------- Middleware --------------------
+from fastapi.responses import JSONResponse
+
 @app.middleware("http")
 async def payload_inspection_middleware(request: Request, call_next):
     path = request.url.path
 
-    # Skip inspection for internal endpoints
+    # Skip internal endpoints
     if path.startswith("/api/blocked-requests") or path.startswith("/health") or path.startswith("/admin"):
         return await call_next(request)
 
@@ -54,15 +56,26 @@ async def payload_inspection_middleware(request: Request, call_next):
     except Exception:
         body_bytes = b""
 
-    try:
-        payload_text = body_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        payload_text = ""
-
+    payload_text = body_bytes.decode("utf-8", errors="ignore") if body_bytes else ""
     qs = request.url.query or ""
     full_payload = payload_text + ("?" + qs if qs else "")
 
     client_ip = request.client.host if request.client else "unknown"
+
+    # 🔹 Check against malicious patterns
+    for pattern, description in BLOCK_RULES:
+        if re.search(pattern, full_payload, re.IGNORECASE):
+            log_incident(client_ip, full_payload, description)
+            # ❌ Instead of proxying → return a clear blocked response
+            return JSONResponse(
+                status_code=403,
+                content={"detail": f"Blocked by WAF: {description}"}
+            )
+
+    # If no rule matched → forward request as usual
+    backend_base = resolve_backend(request.url.path)
+    target = backend_base.rstrip("/") + request.url.path
+    ...
 
     # ... keep the rest of your inspection + forwarding logic below ...
 
@@ -164,5 +177,6 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
 
 
