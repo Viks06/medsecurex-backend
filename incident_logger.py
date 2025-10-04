@@ -9,7 +9,6 @@ database = Database(DATABASE_URL)
 metadata = MetaData()
 
 # --- Table Definitions ---
-# Your existing table for detailed incident reports
 incidents_table = Table(
     "incidents",
     metadata,
@@ -21,7 +20,6 @@ incidents_table = Table(
     Column("status", String(50), default="open"),
 )
 
-# NEW: Table to log every request for usage stats
 requests_table = Table(
     "requests",
     metadata,
@@ -33,7 +31,6 @@ requests_table = Table(
 
 # --- Database Functions ---
 async def setup_database():
-    """Create both tables if they don't exist."""
     try:
         engine = create_engine(DATABASE_URL)
         metadata.create_all(engine)
@@ -50,20 +47,21 @@ async def log_request(status: str, client_ip: str):
             timestamp=datetime.utcnow()
         )
         await database.execute(query)
+        # THIS IS THE NEW, CRUCIAL LOGGING LINE
+        print(f"✅ API usage logged. Status: {status}, IP: {client_ip}")
     except Exception as e:
-        print(f"ERROR: Could not log API usage request. {e}")
+        print(f"❌ ERROR: Could not log API usage request. {e}")
 
 async def log_incident(ip: str, payload: str, rule: str):
     """Logs a blocked request to BOTH tables."""
     try:
-        # 1. Log to the detailed incidents table
         query_incident = incidents_table.insert().values(
             ip=ip, payload=payload, rule_triggered=rule, timestamp=datetime.utcnow()
         )
         await database.execute(query_incident)
         print(f"🚨 Incident logged to DB: {rule} from {ip}")
         
-        # 2. ALSO log it as an 'error' to the requests table for the usage chart
+        # This will now trigger the new success message above
         await log_request(status='error', client_ip=ip)
         
     except Exception as e:
@@ -86,7 +84,6 @@ async def get_incidents():
 async def get_api_usage():
     """Fetch and aggregate API usage stats for the new chart."""
     try:
-        # This SQL query groups all requests into 5-minute intervals
         query = text("""
             SELECT
                 to_char(date_trunc('hour', timestamp) + floor(extract(minute from timestamp) / 5) * interval '5 minutes', 'HH24:MI') as time,
@@ -99,7 +96,6 @@ async def get_api_usage():
         """)
         results = await database.fetch_all(query)
         
-        # Format the data for the frontend chart
         usage_data = []
         for row in results:
             row_dict = dict(row._mapping)
@@ -119,5 +115,4 @@ async def get_api_usage():
         return []
 
 async def mark_incident_handled(incident_id: int):
-    # This function is not the focus of this task
     return True
