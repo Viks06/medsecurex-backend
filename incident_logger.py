@@ -1,4 +1,4 @@
-# incident_logger.py (FINAL ASYNC VERSION)
+# incident_logger.py (FINAL CORRECTED VERSION)
 import os
 from datetime import datetime
 from databases import Database
@@ -6,10 +6,8 @@ from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, St
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# The database object that FastAPI will use
 database = Database(DATABASE_URL)
 
-# SQLAlchemy metadata to define the table structure
 metadata = MetaData()
 incidents_table = Table(
     "incidents",
@@ -23,7 +21,6 @@ incidents_table = Table(
 )
 
 async def setup_database():
-    """Create the incidents table if it doesn't exist."""
     try:
         engine = create_engine(DATABASE_URL)
         metadata.create_all(engine)
@@ -32,7 +29,6 @@ async def setup_database():
         print(f"ERROR: Could not create incidents table. {e}")
 
 async def log_incident(ip: str, payload: str, rule: str):
-    """Insert a new incident into the database."""
     try:
         query = incidents_table.insert().values(
             ip=ip,
@@ -50,8 +46,8 @@ async def get_incidents():
     try:
         query = incidents_table.select().order_by(incidents_table.c.timestamp.desc()).limit(500)
         results = await database.fetch_all(query)
-        # Convert results to a list of dicts and format the timestamp
-        incidents = [dict(row) for row in results]
+        # CORRECTED: Convert database rows to a list of dictionaries
+        incidents = [dict(row._mapping) for row in results]
         for inc in incidents:
             if isinstance(inc.get('timestamp'), datetime):
                 inc['timestamp'] = inc['timestamp'].isoformat()
