@@ -1,10 +1,9 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone # Import timezone
 from databases import Database
 from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, DateTime, Text
 import logging
 
-# Use a standard logger
 logging.basicConfig(level=logging.INFO)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -17,7 +16,8 @@ incidents_table = Table(
     "incidents",
     metadata,
     Column("id", Integer, primary_key=True),
-    Column("timestamp", DateTime, default=datetime.utcnow),
+    # Use DateTime(timezone=True) to store timezone info
+    Column("timestamp", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)),
     Column("ip", String(45)),
     Column("payload", Text),
     Column("rule_triggered", String(255)),
@@ -28,8 +28,8 @@ requests_table = Table(
     "requests",
     metadata,
     Column("id", Integer, primary_key=True),
-    Column("timestamp", DateTime, default=datetime.utcnow),
-    Column("status", String(50)), # 'success' or 'error'
+    Column("timestamp", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)),
+    Column("status", String(50)),
     Column("client_ip", String(45)),
 )
 
@@ -48,9 +48,8 @@ async def log_request(status: str, client_ip: str):
         query = requests_table.insert().values(
             status=status,
             client_ip=client_ip,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc) # Use timezone-aware timestamp
         )
-        logging.info("[log_request] Query created. Executing...")
         await database.execute(query)
         logging.info(f"✅ API usage logged successfully. Status: {status}")
     except Exception as e:
@@ -61,9 +60,8 @@ async def log_incident(ip: str, payload: str, rule: str):
     try:
         # 1. Log to the detailed incidents table
         query_incident = incidents_table.insert().values(
-            ip=ip, payload=payload, rule_triggered=rule, timestamp=datetime.utcnow()
+            ip=ip, payload=payload, rule_triggered=rule, timestamp=datetime.now(timezone.utc) # Use timezone-aware timestamp
         )
-        logging.info("[log_incident] Incident query created. Executing...")
         await database.execute(query_incident)
         logging.info(f"🚨 Incident logged successfully to incidents table.")
         
