@@ -2,6 +2,10 @@ import os
 from datetime import datetime
 from databases import Database
 from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, DateTime, Text
+import logging
+
+# Use a standard logger
+logging.basicConfig(level=logging.INFO)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -34,55 +38,43 @@ async def setup_database():
     try:
         engine = create_engine(DATABASE_URL)
         metadata.create_all(engine)
-        print("✅ All tables setup check complete.")
+        logging.info("✅ All tables setup check complete.")
     except Exception as e:
-        print(f"❌ ERROR: Could not create tables. {e}")
+        logging.error(f"❌ ERROR: Could not create tables. {e}", exc_info=True)
 
 async def log_request(status: str, client_ip: str):
-    """Logs a single request to the new requests table."""
+    logging.info(f"[log_request] Attempting to log status: {status}")
     try:
         query = requests_table.insert().values(
             status=status,
             client_ip=client_ip,
             timestamp=datetime.utcnow()
         )
+        logging.info("[log_request] Query created. Executing...")
         await database.execute(query)
-        # THIS IS THE NEW, CRUCIAL LOGGING LINE
-        print(f"✅ API usage logged. Status: {status}, IP: {client_ip}")
+        logging.info(f"✅ API usage logged successfully. Status: {status}")
     except Exception as e:
-        print(f"❌ ERROR: Could not log API usage request. {e}")
+        logging.error(f"❌ ERROR: Could not log API usage request. {e}", exc_info=True)
 
 async def log_incident(ip: str, payload: str, rule: str):
-    """Logs a blocked request to BOTH tables."""
+    logging.info(f"[log_incident] Attempting to log incident: {rule}")
     try:
+        # 1. Log to the detailed incidents table
         query_incident = incidents_table.insert().values(
             ip=ip, payload=payload, rule_triggered=rule, timestamp=datetime.utcnow()
         )
+        logging.info("[log_incident] Incident query created. Executing...")
         await database.execute(query_incident)
-        print(f"🚨 Incident logged to DB: {rule} from {ip}")
+        logging.info(f"🚨 Incident logged successfully to incidents table.")
         
-        # This will now trigger the new success message above
+        # 2. Log it as an 'error' to the requests table
         await log_request(status='error', client_ip=ip)
         
     except Exception as e:
-        print(f"ERROR: Could not log incident. {e}")
-
-async def get_incidents():
-    """Fetch all incidents from the database."""
-    try:
-        query = incidents_table.select().order_by(incidents_table.c.timestamp.desc()).limit(500)
-        results = await database.fetch_all(query)
-        incidents = [dict(row._mapping) for row in results]
-        for inc in incidents:
-            if isinstance(inc.get('timestamp'), datetime):
-                inc['timestamp'] = inc['timestamp'].isoformat()
-        return incidents
-    except Exception as e:
-        print(f"ERROR: Could not get incidents from DB. {e}")
-        return []
+        logging.error(f"❌ ERROR: Could not log incident. {e}", exc_info=True)
 
 async def get_api_usage():
-    """Fetch and aggregate API usage stats for the new chart."""
+    logging.info("[get_api_usage] Attempting to fetch usage stats.")
     try:
         query = text("""
             SELECT
@@ -95,6 +87,7 @@ async def get_api_usage():
             ORDER BY time;
         """)
         results = await database.fetch_all(query)
+        logging.info(f"[get_api_usage] Found {len(results)} rows.")
         
         usage_data = []
         for row in results:
@@ -111,7 +104,21 @@ async def get_api_usage():
             })
         return usage_data
     except Exception as e:
-        print(f"ERROR: Could not get API usage data. {e}")
+        logging.error(f"❌ ERROR: Could not get API usage data. {e}", exc_info=True)
+        return []
+
+# --- Other Functions (unchanged) ---
+async def get_incidents():
+    try:
+        query = incidents_table.select().order_by(incidents_table.c.timestamp.desc()).limit(500)
+        results = await database.fetch_all(query)
+        incidents = [dict(row._mapping) for row in results]
+        for inc in incidents:
+            if isinstance(inc.get('timestamp'), datetime):
+                inc['timestamp'] = inc['timestamp'].isoformat()
+        return incidents
+    except Exception as e:
+        logging.error(f"ERROR: Could not get incidents from DB. {e}", exc_info=True)
         return []
 
 async def mark_incident_handled(incident_id: int):
