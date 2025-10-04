@@ -16,6 +16,19 @@ from incident_logger import (
 from owasp_rules import OWASP_RULES
 from regex_rules import check_regex_rules
 
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For development. In production, set to your Vercel domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
 app = FastAPI()
 
 @app.on_event("startup")
@@ -114,3 +127,4 @@ def health():
 async def catch_all(request: Request, path_name: str):
     # This endpoint now represents all your backend services (e.g., /submit, /users)
     return {"message": "Request was not blocked by WAF and was processed.", "path": f"/{path_name}"}
+
