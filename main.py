@@ -1,4 +1,4 @@
-# main.py (FINAL ASYNC VERSION)
+# main.py (FINAL ASYNC VERSION + DEBUG ENDPOINT)
 import re
 import os
 from typing import Dict, List
@@ -90,48 +90,4 @@ async def payload_inspection_middleware(request: Request, call_next):
 
     backend_base_url = resolve_backend(path)
     target_url = f"{backend_base_url}{path}?{request.url.query}"
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    async with httpx.AsyncClient(timeout=CLIENT_TIMEOUT) as client:
-        try:
-            resp = await client.request(method=request.method, url=target_url, headers=headers, content=body_bytes)
-            return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
-        except httpx.RequestError:
-            return JSONResponse(status_code=502, content={"detail": "Bad Gateway: Upstream service is unreachable"})
-
-# --- API Endpoints (now async) ---
-@app.get("/api/blocked-requests")
-async def blocked_requests():
-    incidents = await get_incidents()
-    buckets = defaultdict(int)
-    for inc in incidents:
-        try:
-            dt = datetime.fromisoformat(inc["timestamp"])
-            minute = (dt.minute // 5) * 5
-            time_key = f"{dt.hour:02d}:{minute:02d}"
-            buckets[time_key] += 1
-        except (ValueError, KeyError, TypeError): continue
-    sorted_buckets = sorted(buckets.items())
-    return [{"time": t, "blocked": c} for t, c in sorted_buckets]
-
-@app.post("/api/incidents")
-async def receive_incident(data: dict, key: str):
-    admin_auth(key)
-    await log_incident(data.get("ip", "unknown"), data.get("payload", ""), data.get("rule", "external_alert"))
-    return {"status": "incident logged"}
-
-@app.get("/admin/incidents")
-async def admin_list_incidents(key: str):
-    admin_auth(key)
-    return await get_incidents()
-
-@app.post("/admin/incidents/{incident_id}/handle")
-async def admin_handle_incident(incident_id: int, key: str):
-    admin_auth(key)
-    if await mark_incident_handled(incident_id):
-        return {"message": f"Incident {incident_id} marked as handled"}
-    raise HTTPException(status_code=404, detail="Incident not found")
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    headers = dict(request.headers
