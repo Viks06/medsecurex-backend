@@ -3,4 +3,5 @@ uvicorn
 httpx
 requests
 sqlalchemy
-psycopg2-binary
+asyncpg
+databases[postgresql]
