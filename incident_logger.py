@@ -1,72 +1,71 @@
+# incident_logger.py (FINAL ASYNC VERSION)
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, text
+from databases import Database
+from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, DateTime, Text
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-try:
-    engine = create_engine(DATABASE_URL)
-except Exception as e:
-    print(f"FATAL: Could not create database engine. {e}")
-    engine = None
+# The database object that FastAPI will use
+database = Database(DATABASE_URL)
 
-def setup_database():
-    if not engine:
-        print("ERROR: Database engine not available. Cannot set up table.")
-        return
+# SQLAlchemy metadata to define the table structure
+metadata = MetaData()
+incidents_table = Table(
+    "incidents",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("timestamp", DateTime, default=datetime.utcnow),
+    Column("ip", String(45)),
+    Column("payload", Text),
+    Column("rule_triggered", String(255)),
+    Column("status", String(50), default="open"),
+)
+
+async def setup_database():
+    """Create the incidents table if it doesn't exist."""
     try:
-        with engine.connect() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS incidents (
-                    id SERIAL PRIMARY KEY,
-                    timestamp TIMESTAMPTZ NOT NULL,
-                    ip VARCHAR(45),
-                    payload TEXT,
-                    rule_triggered VARCHAR(255),
-                    status VARCHAR(50)
-                );
-            """))
-            conn.commit()
+        engine = create_engine(DATABASE_URL)
+        metadata.create_all(engine)
+        print("Table setup check complete.")
     except Exception as e:
         print(f"ERROR: Could not create incidents table. {e}")
 
-def log_incident(ip: str, payload: str, rule: str):
-    if not engine:
-        print("ERROR: Database engine not available. Cannot log incident.")
-        return
+async def log_incident(ip: str, payload: str, rule: str):
+    """Insert a new incident into the database."""
     try:
-        with engine.connect() as conn:
-            conn.execute(text("""
-                INSERT INTO incidents (timestamp, ip, payload, rule_triggered, status)
-                VALUES (:ts, :ip, :payload, :rule, :status)
-            """), {
-                "ts": datetime.utcnow(),
-                "ip": ip,
-                "payload": payload,
-                "rule": rule,
-                "status": "open"
-            })
-            conn.commit()
+        query = incidents_table.insert().values(
+            ip=ip,
+            payload=payload,
+            rule_triggered=rule,
+            timestamp=datetime.utcnow()
+        )
+        await database.execute(query)
         print(f"🚨 Incident logged to DB: {rule} from {ip}")
     except Exception as e:
         print(f"ERROR: Could not log incident to DB. {e}")
 
-def get_incidents():
-    if not engine:
-        print("ERROR: Database engine not available. Cannot get incidents.")
-        return []
+async def get_incidents():
+    """Fetch all incidents from the database."""
     try:
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT * FROM incidents ORDER BY timestamp DESC LIMIT 500"))
-            incidents = [dict(row._mapping) for row in result]
-            for inc in incidents:
-                if isinstance(inc.get('timestamp'), datetime):
-                    inc['timestamp'] = inc['timestamp'].isoformat()
-            return incidents
+        query = incidents_table.select().order_by(incidents_table.c.timestamp.desc()).limit(500)
+        results = await database.fetch_all(query)
+        # Convert results to a list of dicts and format the timestamp
+        incidents = [dict(row) for row in results]
+        for inc in incidents:
+            if isinstance(inc.get('timestamp'), datetime):
+                inc['timestamp'] = inc['timestamp'].isoformat()
+        return incidents
     except Exception as e:
         print(f"ERROR: Could not get incidents from DB. {e}")
         return []
 
-def mark_incident_handled(index: int):
-    print(f"NOTE: mark_incident_handled({index}) needs to be updated for database use.")
-    return True
+async def mark_incident_handled(incident_id: int):
+    """Mark an incident as handled in the database."""
+    try:
+        query = incidents_table.update().where(incidents_table.c.id == incident_id).values(status="handled")
+        await database.execute(query)
+        return True
+    except Exception as e:
+        print(f"ERROR: Could not mark incident {incident_id} as handled. {e}")
+        return False
