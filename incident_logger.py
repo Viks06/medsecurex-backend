@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone # Import timezone
+from datetime import datetime, timezone
 from databases import Database
 from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, DateTime, Text
 import logging
@@ -16,7 +16,6 @@ incidents_table = Table(
     "incidents",
     metadata,
     Column("id", Integer, primary_key=True),
-    # Use DateTime(timezone=True) to store timezone info
     Column("timestamp", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)),
     Column("ip", String(45)),
     Column("payload", Text),
@@ -35,44 +34,58 @@ requests_table = Table(
 
 # --- Database Functions ---
 async def setup_database():
+    """
+    Creates both tables using 'IF NOT EXISTS' to prevent errors on restart.
+    """
+    logging.info("[DB Setup] Starting setup...")
     try:
-        engine = create_engine(DATABASE_URL)
-        metadata.create_all(engine)
+        async with database.transaction():
+            # Use raw SQL with 'IF NOT EXISTS' for maximum compatibility
+            await database.execute(text("""
+                CREATE TABLE IF NOT EXISTS incidents (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    ip VARCHAR(45),
+                    payload TEXT,
+                    rule_triggered VARCHAR(255),
+                    status VARCHAR(50)
+                );
+            """))
+            await database.execute(text("""
+                CREATE TABLE IF NOT EXISTS requests (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    status VARCHAR(50),
+                    client_ip VARCHAR(45)
+                );
+            """))
         logging.info("✅ All tables setup check complete.")
     except Exception as e:
         logging.error(f"❌ ERROR: Could not create tables. {e}", exc_info=True)
 
+
 async def log_request(status: str, client_ip: str):
-    logging.info(f"[log_request] Attempting to log status: {status}")
     try:
         query = requests_table.insert().values(
-            status=status,
-            client_ip=client_ip,
-            timestamp=datetime.now(timezone.utc) # Use timezone-aware timestamp
+            status=status, client_ip=client_ip, timestamp=datetime.now(timezone.utc)
         )
         await database.execute(query)
-        logging.info(f"✅ API usage logged successfully. Status: {status}")
+        logging.info(f"✅ API usage logged. Status: {status}")
     except Exception as e:
         logging.error(f"❌ ERROR: Could not log API usage request. {e}", exc_info=True)
 
 async def log_incident(ip: str, payload: str, rule: str):
-    logging.info(f"[log_incident] Attempting to log incident: {rule}")
     try:
-        # 1. Log to the detailed incidents table
         query_incident = incidents_table.insert().values(
-            ip=ip, payload=payload, rule_triggered=rule, timestamp=datetime.now(timezone.utc) # Use timezone-aware timestamp
+            ip=ip, payload=payload, rule_triggered=rule, timestamp=datetime.now(timezone.utc)
         )
         await database.execute(query_incident)
-        logging.info(f"🚨 Incident logged successfully to incidents table.")
-        
-        # 2. Log it as an 'error' to the requests table
+        logging.info(f"🚨 Incident logged to incidents table.")
         await log_request(status='error', client_ip=ip)
-        
     except Exception as e:
         logging.error(f"❌ ERROR: Could not log incident. {e}", exc_info=True)
 
 async def get_api_usage():
-    logging.info("[get_api_usage] Attempting to fetch usage stats.")
     try:
         query = text("""
             SELECT
@@ -85,27 +98,21 @@ async def get_api_usage():
             ORDER BY time;
         """)
         results = await database.fetch_all(query)
-        logging.info(f"[get_api_usage] Found {len(results)} rows.")
-        
         usage_data = []
         for row in results:
             row_dict = dict(row._mapping)
             success_count = int(row_dict.get('success', 0))
             error_count = int(row_dict.get('errors', 0))
             total_requests = success_count + error_count
-            
             usage_data.append({
-                "time": row_dict['time'],
-                "rps": total_requests,
-                "success": success_count,
-                "errors": error_count
+                "time": row_dict['time'], "rps": total_requests,
+                "success": success_count, "errors": error_count
             })
         return usage_data
     except Exception as e:
         logging.error(f"❌ ERROR: Could not get API usage data. {e}", exc_info=True)
         return []
 
-# --- Other Functions (unchanged) ---
 async def get_incidents():
     try:
         query = incidents_table.select().order_by(incidents_table.c.timestamp.desc()).limit(500)
@@ -121,3 +128,4 @@ async def get_incidents():
 
 async def mark_incident_handled(incident_id: int):
     return True
+
