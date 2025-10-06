@@ -79,7 +79,21 @@ async def payload_inspection_middleware(request: Request, call_next):
 # --- API Endpoints ---
 @app.get("/api/blocked-requests")
 async def blocked_requests():
-    return await get_incidents()
+    """
+    CORRECTED: This now aggregates the data into time buckets again.
+    """
+    incidents = await get_incidents()
+    buckets = defaultdict(int)
+    for inc in incidents:
+        try:
+            dt = datetime.fromisoformat(inc["timestamp"])
+            minute = (dt.minute // 5) * 5
+            time_key = f"{dt.hour:02d}:{minute:02d}"
+            buckets[time_key] += 1
+        except (ValueError, KeyError, TypeError):
+            continue
+    sorted_buckets = sorted(buckets.items())
+    return [{"time": t, "blocked": c} for t, c in sorted_buckets]
 
 @app.get("/api/api-usage")
 async def api_usage():
@@ -94,7 +108,7 @@ async def admin_list_incidents(key: str):
 def health():
     return {"status": "ok"}
 
-# --- NEW: Temporary Debug Endpoint to Reset the Database ---
+# --- Temporary Debug Endpoint to Reset the Database ---
 @app.get("/admin/reset-db")
 async def reset_db(key: str):
     admin_auth(key)
@@ -104,6 +118,7 @@ async def reset_db(key: str):
             await database.execute(text("DROP TABLE IF EXISTS requests;"))
             await database.execute(text("DROP TABLE IF EXISTS incidents;"))
         print("--- [ADMIN] Tables dropped successfully. The server will now restart. ---")
+        # NOTE: You may need to manually restart the service on Render after this.
         return {"message": "Database tables dropped. Server is restarting to recreate them."}
     except Exception as e:
         print(f"--- [ADMIN] ERROR dropping tables: {e} ---")
@@ -113,3 +128,4 @@ async def reset_db(key: str):
 @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def catch_all(request: Request, path_name: str):
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
+
