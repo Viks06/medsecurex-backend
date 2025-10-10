@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 import logging
 
-# Use a standard logger
 logging.basicConfig(level=logging.INFO)
 
 from incident_logger import (
@@ -18,7 +17,8 @@ from incident_logger import (
     get_incidents,
     mark_incident_handled,
     log_request,
-    get_api_usage
+    get_api_usage,
+    get_detected_ttps # Import the new function
 )
 from owasp_rules import OWASP_RULES
 from regex_rules import check_regex_rules
@@ -51,10 +51,7 @@ def admin_auth(key: str):
 @app.middleware("http")
 async def payload_inspection_middleware(request: Request, call_next):
     path = request.url.path
-    logging.info(f"Middleware received request: {request.method} {path}")
-
     if path.startswith(("/api/", "/admin", "/health")):
-        logging.info("Skipping middleware for internal endpoint.")
         return await call_next(request)
 
     client_ip = request.client.host if request.client else "unknown"
@@ -63,13 +60,10 @@ async def payload_inspection_middleware(request: Request, call_next):
         body_bytes = await request.body()
         payload_text = body_bytes.decode("utf-8", errors="ignore")
         full_payload = payload_text + request.url.query
-        logging.info("Successfully read request body and query params.")
-    except Exception as e:
-        logging.error(f"Could not read request body: {e}", exc_info=True)
-        # If body can't be read, just inspect the query params
+    except Exception:
         full_payload = request.url.query
 
-    # --- Security Checks ---
+    # Security checks
     for rule_name, rule_fn in OWASP_RULES.items():
         if callable(rule_fn) and rule_fn(full_payload):
             await log_incident(client_ip, full_payload, rule_name)
@@ -81,10 +75,8 @@ async def payload_inspection_middleware(request: Request, call_next):
             await log_incident(client_ip, full_payload, r)
         return JSONResponse(status_code=403, content={"detail": f"Blocked by Regex rule(s): {', '.join(triggered_regex)}"})
 
-    # --- Success Logging ---
+    # If not blocked, log as success and proceed
     await log_request(status='success', client_ip=client_ip)
-    
-    # Proceed to the actual endpoint
     response = await call_next(request)
     return response
 
@@ -108,6 +100,11 @@ async def blocked_requests():
 async def api_usage():
     return await get_api_usage()
 
+# NEW: Endpoint for the TTPs Table
+@app.get("/api/ttp-detected")
+async def ttp_detected():
+    return await get_detected_ttps()
+
 @app.get("/admin/incidents")
 async def admin_list_incidents(key: str):
     admin_auth(key)
@@ -124,7 +121,8 @@ async def reset_db(key: str):
         async with database.transaction():
             await database.execute(text("DROP TABLE IF EXISTS requests;"))
             await database.execute(text("DROP TABLE IF EXISTS incidents;"))
-        return {"message": "Database tables dropped. Server is restarting to recreate them."}
+            await database.execute(text("DROP TABLE IF EXISTS ttps;"))
+        return {"message": "All database tables dropped."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -132,4 +130,3 @@ async def reset_db(key: str):
 @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def catch_all(request: Request, path_name: str):
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
-
