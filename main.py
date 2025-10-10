@@ -8,42 +8,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 import logging
 
-# Use a standard logger with a clear format
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 from incident_logger import (
-    database,
-    setup_database,
-    log_incident,
-    get_incidents,
-    mark_incident_handled,
-    log_request,
-    get_api_usage
+    database, setup_database, log_incident, get_incidents,
+    log_request, get_api_usage, get_detected_ttps
 )
 from owasp_rules import OWASP_RULES
 from regex_rules import check_regex_rules
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
 async def startup():
-    logging.info("--- SERVER STARTUP SEQUENCE ---")
     await database.connect()
     await setup_database()
-    logging.info("--- STARTUP COMPLETE ---")
 
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
-    logging.info("--- SERVER SHUTDOWN COMPLETE ---")
 
 ADMIN_KEY = "supersecretadminkey"
 
@@ -54,55 +39,57 @@ def admin_auth(key: str):
 @app.middleware("http")
 async def payload_inspection_middleware(request: Request, call_next):
     path = request.url.path
-    logging.info(f"[WAF] New request received for path: {path}")
-
     if path.startswith(("/api/", "/admin", "/health")):
-        logging.info(f"[WAF] Skipping WAF for internal path: {path}")
         return await call_next(request)
 
     client_ip = request.client.host if request.client else "unknown"
     full_payload = ""
     try:
-        logging.info("[WAF] Reading request body...")
         body_bytes = await request.body()
         payload_text = body_bytes.decode("utf-8", errors="ignore")
         full_payload = payload_text + request.url.query
-        logging.info(f"[WAF] Full payload to inspect (truncated): {full_payload[:200]}")
-    except Exception as e:
-        logging.error(f"[WAF] Error reading request body: {e}", exc_info=True)
+    except Exception:
         full_payload = request.url.query
 
     # --- Security Checks ---
-    logging.info("[WAF] Starting security rule checks...")
+    # 1. Check OWASP rules
     for rule_name, rule_fn in OWASP_RULES.items():
         if callable(rule_fn) and rule_fn(full_payload):
-            logging.warning(f"[WAF] BLOCKED by OWASP rule: {rule_name}")
             await log_incident(client_ip, full_payload, rule_name)
             return JSONResponse(status_code=403, content={"detail": f"Blocked by WAF rule: {rule_name}"})
     
+    # 2. Check complex regex rules
     triggered_regex = check_regex_rules(full_payload)
     if triggered_regex:
-        logging.warning(f"[WAF] BLOCKED by Regex rule(s): {', '.join(triggered_regex)}")
         for r in triggered_regex:
             await log_incident(client_ip, full_payload, r)
         return JSONResponse(status_code=403, content={"detail": f"Blocked by Regex rule(s): {', '.join(triggered_regex)}"})
 
-    # If not blocked, log as success and proceed
-    logging.info("[WAF] No rules matched. Request is safe. Logging as 'success'.")
+    # --- If no rules matched, log as success and proceed ---
     await log_request(status='success', client_ip=client_ip)
-    
-    response = await call_next(request)
-    logging.info(f"[WAF] Request to {path} processed with status: {response.status_code}")
-    return response
+    return await call_next(request)
 
 # --- API Endpoints ---
 @app.get("/api/blocked-requests")
 async def blocked_requests():
-    return await get_incidents()
+    incidents = await get_incidents()
+    buckets = defaultdict(int)
+    for inc in incidents:
+        try:
+            dt = datetime.fromisoformat(inc["timestamp"])
+            minute = (dt.minute // 5) * 5
+            time_key = f"{dt.hour:02d}:{minute:02d}"
+            buckets[time_key] += 1
+        except (ValueError, KeyError, TypeError): continue
+    return [{"time": t, "blocked": c} for t, c in sorted(buckets.items())]
 
 @app.get("/api/api-usage")
 async def api_usage():
     return await get_api_usage()
+
+@app.get("/api/ttp-detected")
+async def ttp_detected():
+    return await get_detected_ttps()
 
 @app.get("/admin/incidents")
 async def admin_list_incidents(key: str):
@@ -121,11 +108,12 @@ async def reset_db(key: str):
             await database.execute(text("DROP TABLE IF EXISTS requests;"))
             await database.execute(text("DROP TABLE IF EXISTS incidents;"))
             await database.execute(text("DROP TABLE IF EXISTS ttps;"))
-        return {"message": "All database tables dropped. Server will restart to recreate them."}
+        # The server will likely restart after this, which is fine.
+        return {"message": "All database tables dropped. The server will restart and recreate them."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Catch-all Dummy Endpoint ---
+# --- Catch-all Dummy Endpoint for safe requests ---
 @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def catch_all(request: Request, path_name: str):
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
