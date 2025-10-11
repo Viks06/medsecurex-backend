@@ -1,201 +1,166 @@
-import re
 import os
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from datetime import datetime
-from collections import defaultdict
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from datetime import datetime, timezone
+from databases import Database
+from sqlalchemy import MetaData, Table, Column, Integer, String, DateTime, Text
 import logging
 
 logging.basicConfig(level=logging.INFO)
 
-from incident_logger import (
-    database,
-    setup_database,
-    log_incident,
-    get_incidents,
-    mark_incident_handled,
-    log_request,
-    get_api_usage
-)
-from owasp_rules import OWASP_RULES
-from regex_rules import check_regex_rules
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is required")
 
-app = FastAPI()
+database = Database(DATABASE_URL)
+metadata = MetaData()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# --- Tables ---
+incidents_table = Table(
+    "incidents", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("timestamp", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)),
+    Column("ip", String(45)),
+    Column("payload", Text),
+    Column("rule_triggered", String(255)),
+    Column("status", String(50), default="open"),
+    Column("ttp_id", String(10)),
 )
 
-ADMIN_KEY = os.getenv("ADMIN_KEY", "supersecretadminkey")
+requests_table = Table(
+    "requests", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("timestamp", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)),
+    Column("status", String(50)),
+    Column("client_ip", String(45)),
+)
 
 
-@app.on_event("startup")
-async def startup():
-    try:
-        await database.connect()
-        logging.info("Connected to database.")
-        await setup_database()
-    except Exception as e:
-        logging.exception("Startup error (DB): %s", e)
-        raise
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
-
-
-def admin_auth(key: str):
-    if key != ADMIN_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-@app.middleware("http")
-async def payload_inspection_middleware(request: Request, call_next):
-    path = request.url.path
-    client_ip = request.client.host if request.client else "unknown"
-    full_payload = ""
-
-    try:
-        body_bytes = await request.body()
-        payload_text = body_bytes.decode("utf-8", errors="ignore")
-        full_payload = payload_text + request.url.query
-    except Exception as e:
-        logging.warning(f"Could not read request body: {e}")
-        full_payload = request.url.query
-
-    # --- Security Checks for non-admin endpoints ---
-    if not path.startswith(("/admin", "/health")):
-        for rule_name, rule_fn in OWASP_RULES.items():
-            if callable(rule_fn) and rule_fn(full_payload):
-                await log_incident(client_ip, full_payload, rule_name)
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": f"Blocked by WAF rule: {rule_name}"}
-                )
-
-        triggered_regex = check_regex_rules(full_payload)
-        if triggered_regex:
-            for r in triggered_regex:
-                await log_incident(client_ip, full_payload, r)
-            return JSONResponse(
-                status_code=403,
-                content={"detail": f"Blocked by Regex rule(s): {', '.join(triggered_regex)}"}
-            )
-
-    # --- Log all requests ---
-    await log_request(status='success', client_ip=client_ip)
-
-    response = await call_next(request)
-    return response
-
-
-# --- API Endpoints ---
-
-@app.get("/api/blocked-requests")
-async def blocked_requests():
-    incidents = await get_incidents()
-    buckets = defaultdict(int)
-    for inc in incidents:
-        try:
-            dt = datetime.fromisoformat(inc["timestamp"])
-            minute = (dt.minute // 5) * 5
-            time_key = f"{dt.hour:02d}:{minute:02d}"
-            buckets[time_key] += 1
-        except (ValueError, KeyError, TypeError):
-            continue
-    sorted_buckets = sorted(buckets.items())
-    return [{"time": t, "blocked": c} for t, c in sorted_buckets]
-
-
-@app.get("/api/api-usage")
-async def api_usage():
-    return await get_api_usage()
-
-
-@app.get("/api/alerts")
-async def get_alerts_list():
-    incidents_from_db = await get_incidents()
-
-    formatted_alerts = []
-    for inc in incidents_from_db:
-        rule = inc.get("rule_triggered") or inc.get("payload") or "Unknown"
-
-        # Severity heuristic
-        severity = "Medium"
-        if any(x in rule.upper() for x in ["SQL", "SQLI", "DROP"]):
-            severity = "Critical"
-        elif any(x in rule.upper() for x in ["XSS", "<SCRIPT"]):
-            severity = "Critical"
-        elif any(x in rule.upper() for x in ["SSRF", "METADATA"]):
-            severity = "High"
-
-        # Status mapping
-        raw_status = (inc.get("status") or "open").lower()
-        status_map = {
-            "open": "New",
-            "new": "New",
-            "in_progress": "In Progress",
-            "inprogress": "In Progress",
-            "resolved": "Resolved",
-            "dismissed": "Dismissed"
-        }
-        ui_status = status_map.get(raw_status, "New")
-
-        formatted_alerts.append({
-            "description": rule,
-            "ttp_id": inc.get("ttp_id", "T1190"),
-            "severity": severity,
-            "status": ui_status,
-            "timestamp": inc.get("timestamp"),
-        })
-
-    sorted_alerts = sorted(
-        formatted_alerts,
-        key=lambda x: x.get("timestamp") or "",
-        reverse=True
-    )
-    return sorted_alerts
-
-
-@app.get("/api/ttps")
-async def get_ttps():
-    # For demo purposes, return the unique TTP IDs in incidents
-    incidents = await get_incidents()
-    ttps = list({inc.get("ttp_id", "T1190") for inc in incidents})
-    return ttps
-
-
-@app.get("/admin/incidents")
-async def admin_list_incidents(key: str):
-    admin_auth(key)
-    return await get_incidents()
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/admin/reset-db")
-async def reset_db(key: str):
-    admin_auth(key)
+# --- DB Setup ---
+async def setup_database():
+    logging.info("[DB Setup] Starting...")
     try:
         async with database.transaction():
-            await database.execute(text("DROP TABLE IF EXISTS requests;"))
-            await database.execute(text("DROP TABLE IF EXISTS incidents;"))
-        return {"message": "Database tables dropped. Server is restarting to recreate them."}
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS incidents (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    ip VARCHAR(45),
+                    payload TEXT,
+                    rule_triggered VARCHAR(255),
+                    status VARCHAR(50),
+                    ttp_id VARCHAR(10)
+                );
+            """)
+            await database.execute("""
+                CREATE TABLE IF NOT EXISTS requests (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    status VARCHAR(50),
+                    client_ip VARCHAR(45)
+                );
+            """)
+        logging.info("✅ Tables ready")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"❌ DB Setup failed: {e}", exc_info=True)
 
 
-# Catch-all endpoint
-@app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def catch_all(request: Request, path_name: str):
-    return {"message": "Request processed successfully.", "path": f"/{path_name}"}
+# --- Logging ---
+async def log_request(status: str, client_ip: str):
+    try:
+        query = requests_table.insert().values(
+            status=status, client_ip=client_ip, timestamp=datetime.now(timezone.utc)
+        )
+        await database.execute(query)
+        logging.info(f"✅ Request logged: {status}")
+    except Exception as e:
+        logging.error(f"❌ Could not log request: {e}", exc_info=True)
+
+
+async def log_incident(ip: str, payload: str, rule: str):
+    try:
+        TTP_MAP = {
+            "Broken Access Control": "T1548",
+            "Cryptographic Failures": "T1600",
+            "Injection": "T1055",
+            "SQL Injection": "T1055",
+            "Insecure Design": "T1601",
+            "Security Misconfiguration": "T1547",
+            "Vulnerable and Outdated Components": "T1555",
+            "Identification and Authentication Failures": "T1078",
+            "Software and Data Integrity Failures": "T1553",
+            "Server-Side Request Forgery (SSRF)": "T1595",
+            "Logging and Monitoring Failures": "T1562",
+            "XSS": "T1059",
+            "Directory Traversal": "T1083",
+        }
+
+        ttp_id_to_log = TTP_MAP.get(rule, "T1190")
+        query_incident = incidents_table.insert().values(
+            ip=ip,
+            payload=payload,
+            rule_triggered=rule,
+            status="open",
+            ttp_id=ttp_id_to_log,
+            timestamp=datetime.now(timezone.utc)
+        )
+        await database.execute(query_incident)
+        logging.info(f"🚨 Incident logged ({rule}) with TTP ID {ttp_id_to_log}")
+        await log_request(status='error', client_ip=ip)
+    except Exception as e:
+        logging.error(f"❌ Could not log incident: {e}", exc_info=True)
+
+
+# --- Fetch ---
+async def get_api_usage():
+    try:
+        results = await database.fetch_all("""
+            SELECT
+                to_char(date_trunc('hour', timestamp) + floor(extract(minute from timestamp)/5) * interval '5 minutes','HH24:MI') as time,
+                COUNT(CASE WHEN status='success' THEN 1 END) as success,
+                COUNT(CASE WHEN status='error' THEN 1 END) as errors
+            FROM requests
+            WHERE timestamp > NOW() - INTERVAL '1 hour'
+            GROUP BY time
+            ORDER BY time;
+        """)
+        usage_data = []
+        for row in results:
+            row_dict = dict(row._mapping)
+            success_count = int(row_dict.get('success', 0))
+            error_count = int(row_dict.get('errors', 0))
+            total_requests = success_count + error_count
+            usage_data.append({
+                "time": row_dict['time'],
+                "rps": total_requests,
+                "success": success_count,
+                "errors": error_count
+            })
+        return usage_data
+    except Exception as e:
+        logging.error(f"❌ Could not get API usage: {e}", exc_info=True)
+        return []
+
+
+async def get_incidents():
+    try:
+        results = await database.fetch_all(
+            incidents_table.select().order_by(incidents_table.c.timestamp.desc()).limit(500)
+        )
+        incidents = [dict(row._mapping) for row in results]
+        for inc in incidents:
+            if isinstance(inc.get('timestamp'), datetime):
+                inc['timestamp'] = inc['timestamp'].isoformat()
+        return incidents
+    except Exception as e:
+        logging.error(f"❌ Could not get incidents: {e}", exc_info=True)
+        return []
+
+
+async def mark_incident_handled(incident_id: int):
+    try:
+        q = incidents_table.update().where(incidents_table.c.id == incident_id).values(status='resolved')
+        await database.execute(q)
+        logging.info(f"✅ Incident {incident_id} marked as resolved")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Could not mark incident handled: {e}", exc_info=True)
+        return False
