@@ -4,4 +4,6 @@ httpx
 requests
 sqlalchemy
 asyncpg
+tenacity==8.2.3
 databases[postgresql]
+
