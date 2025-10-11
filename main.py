@@ -1,4 +1,3 @@
-# main.py
 import re
 import os
 from fastapi import FastAPI, Request, HTTPException
@@ -9,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 import logging
 
-# Standard logger
 logging.basicConfig(level=logging.INFO)
 
 from incident_logger import (
@@ -34,6 +32,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+ADMIN_KEY = os.getenv("ADMIN_KEY", "supersecretadminkey")
+
+
 @app.on_event("startup")
 async def startup():
     try:
@@ -44,56 +45,59 @@ async def startup():
         logging.exception("Startup error (DB): %s", e)
         raise
 
+
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
 
-ADMIN_KEY = "supersecretadminkey"
 
 def admin_auth(key: str):
     if key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
 @app.middleware("http")
 async def payload_inspection_middleware(request: Request, call_next):
     path = request.url.path
-    logging.info(f"Middleware received request: {request.method} {path}")
-
-    if path.startswith(("/api/", "/admin", "/health")):
-        logging.info("Skipping middleware for internal endpoint.")
-        return await call_next(request)
-
     client_ip = request.client.host if request.client else "unknown"
     full_payload = ""
+
     try:
         body_bytes = await request.body()
         payload_text = body_bytes.decode("utf-8", errors="ignore")
         full_payload = payload_text + request.url.query
-        logging.info("Successfully read request body and query params.")
     except Exception as e:
-        logging.error(f"Could not read request body: {e}", exc_info=True)
+        logging.warning(f"Could not read request body: {e}")
         full_payload = request.url.query
 
-    # --- Security Checks ---
-    for rule_name, rule_fn in OWASP_RULES.items():
-        if callable(rule_fn) and rule_fn(full_payload):
-            await log_incident(client_ip, full_payload, rule_name)
-            return JSONResponse(status_code=403, content={"detail": f"Blocked by WAF rule: {rule_name}"})
+    # --- Security Checks for non-admin endpoints ---
+    if not path.startswith(("/admin", "/health")):
+        for rule_name, rule_fn in OWASP_RULES.items():
+            if callable(rule_fn) and rule_fn(full_payload):
+                await log_incident(client_ip, full_payload, rule_name)
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": f"Blocked by WAF rule: {rule_name}"}
+                )
 
-    triggered_regex = check_regex_rules(full_payload)
-    if triggered_regex:
-        for r in triggered_regex:
-            await log_incident(client_ip, full_payload, r)
-        return JSONResponse(status_code=403, content={"detail": f"Blocked by Regex rule(s): {', '.join(triggered_regex)}"})
+        triggered_regex = check_regex_rules(full_payload)
+        if triggered_regex:
+            for r in triggered_regex:
+                await log_incident(client_ip, full_payload, r)
+            return JSONResponse(
+                status_code=403,
+                content={"detail": f"Blocked by Regex rule(s): {', '.join(triggered_regex)}"}
+            )
 
-    # --- Success Logging ---
+    # --- Log all requests ---
     await log_request(status='success', client_ip=client_ip)
 
-    # Proceed to the actual endpoint
     response = await call_next(request)
     return response
 
+
 # --- API Endpoints ---
+
 @app.get("/api/blocked-requests")
 async def blocked_requests():
     incidents = await get_incidents()
@@ -109,29 +113,30 @@ async def blocked_requests():
     sorted_buckets = sorted(buckets.items())
     return [{"time": t, "blocked": c} for t, c in sorted_buckets]
 
+
 @app.get("/api/api-usage")
 async def api_usage():
     return await get_api_usage()
 
+
 @app.get("/api/alerts")
 async def get_alerts_list():
-    """
-    New endpoint merged from C02
-    Returns a list of alerts formatted for frontend Alerts component
-    """
     incidents_from_db = await get_incidents()
-    formatted_alerts = []
 
+    formatted_alerts = []
     for inc in incidents_from_db:
         rule = inc.get("rule_triggered") or inc.get("payload") or "Unknown"
+
+        # Severity heuristic
         severity = "Medium"
-        if "SQL" in rule.upper() or "SQLI" in rule.upper() or "DROP" in rule.upper():
+        if any(x in rule.upper() for x in ["SQL", "SQLI", "DROP"]):
             severity = "Critical"
-        elif "XSS" in rule.upper() or "<SCRIPT" in rule.upper():
+        elif any(x in rule.upper() for x in ["XSS", "<SCRIPT"]):
             severity = "Critical"
-        elif "SSRF" in rule.upper() or "METADATA" in rule.upper():
+        elif any(x in rule.upper() for x in ["SSRF", "METADATA"]):
             severity = "High"
 
+        # Status mapping
         raw_status = (inc.get("status") or "open").lower()
         status_map = {
             "open": "New",
@@ -158,14 +163,25 @@ async def get_alerts_list():
     )
     return sorted_alerts
 
+
+@app.get("/api/ttps")
+async def get_ttps():
+    # For demo purposes, return the unique TTP IDs in incidents
+    incidents = await get_incidents()
+    ttps = list({inc.get("ttp_id", "T1190") for inc in incidents})
+    return ttps
+
+
 @app.get("/admin/incidents")
 async def admin_list_incidents(key: str):
     admin_auth(key)
     return await get_incidents()
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.get("/admin/reset-db")
 async def reset_db(key: str):
@@ -178,7 +194,8 @@ async def reset_db(key: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Catch-all Dummy Endpoint ---
+
+# Catch-all endpoint
 @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def catch_all(request: Request, path_name: str):
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
