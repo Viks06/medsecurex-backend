@@ -2,20 +2,27 @@ import os
 import logging
 from datetime import datetime, timezone
 from databases import Database
-from sqlalchemy import MetaData, Table, Column, Integer, String, DateTime, Text
+from sqlalchemy import text, MetaData, Table, Column, Integer, String, DateTime, Text
+from tenacity import retry, stop_after_attempt, wait_fixed
 
-# --- Logger setup ---
-logging.basicConfig(level=logging.INFO)
+# ------------------------------------------------------------
+# 🔧 Setup Logging
+# ------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# --- Database URL ---
+# ------------------------------------------------------------
+# 🌐 Database Setup
+# ------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is required")
+    raise RuntimeError("❌ DATABASE_URL environment variable not set!")
 
 database = Database(DATABASE_URL)
 metadata = MetaData()
 
-# --- Table definitions ---
+# ------------------------------------------------------------
+# 🧱 Table Definitions
+# ------------------------------------------------------------
 incidents_table = Table(
     "incidents",
     metadata,
@@ -25,7 +32,6 @@ incidents_table = Table(
     Column("payload", Text),
     Column("rule_triggered", String(255)),
     Column("status", String(50), default="open"),
-    Column("ttp_id", String(10)),
 )
 
 requests_table = Table(
@@ -37,83 +43,174 @@ requests_table = Table(
     Column("client_ip", String(45)),
 )
 
-# --- Setup database ---
+ttps_table = Table(
+    "ttps",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("timestamp", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)),
+    Column("incident_id", Integer),
+    Column("technique_id", String(100)),
+    Column("technique_name", String(255)),
+    Column("description", Text),
+)
+
+# ------------------------------------------------------------
+# 🛠 Database Setup Function
+# ------------------------------------------------------------
+
+@retry(stop=stop_after_attempt(5), wait=wait_fixed(2))
 async def setup_database():
-    logging.info("[DB Setup] Creating tables if not exists...")
-    async with database.transaction():
-        # SQLAlchemy Table create statements with IF NOT EXISTS
-        await database.execute(f"""
+    """Ensures all tables exist. Retries up to 5 times if the DB is slow to connect."""
+    logging.info("[DB Setup] Initializing tables...")
+
+    try:
+        # Avoid nested transactions (Render’s DB may block on them)
+        await database.execute(text("""
             CREATE TABLE IF NOT EXISTS incidents (
                 id SERIAL PRIMARY KEY,
                 timestamp TIMESTAMPTZ NOT NULL,
                 ip VARCHAR(45),
                 payload TEXT,
                 rule_triggered VARCHAR(255),
-                status VARCHAR(50),
-                ttp_id VARCHAR(10)
+                status VARCHAR(50)
             );
-        """)
-        await database.execute(f"""
+        """))
+
+        await database.execute(text("""
             CREATE TABLE IF NOT EXISTS requests (
                 id SERIAL PRIMARY KEY,
                 timestamp TIMESTAMPTZ NOT NULL,
                 status VARCHAR(50),
                 client_ip VARCHAR(45)
             );
-        """)
-    logging.info("✅ Tables are ready.")
+        """))
 
-# --- Log API request usage ---
+        await database.execute(text("""
+            CREATE TABLE IF NOT EXISTS ttps (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMPTZ NOT NULL,
+                incident_id INTEGER,
+                technique_id VARCHAR(100),
+                technique_name VARCHAR(255),
+                description TEXT
+            );
+        """))
+
+        logging.info("✅ Database tables confirmed / created successfully.")
+    except Exception as e:
+        logging.error(f"❌ Database setup failed: {e}", exc_info=True)
+        raise
+
+
+# ------------------------------------------------------------
+# 🧾 Logging Functions
+# ------------------------------------------------------------
+
 async def log_request(status: str, client_ip: str):
+    """Logs a single API request."""
     try:
         query = requests_table.insert().values(
-            status=status, client_ip=client_ip, timestamp=datetime.now(timezone.utc)
+            status=status,
+            client_ip=client_ip,
+            timestamp=datetime.now(timezone.utc),
         )
         await database.execute(query)
-        logging.info(f"✅ Logged API request: {status} from {client_ip}")
+        logging.info(f"✅ Request logged: {status} from {client_ip}")
     except Exception as e:
         logging.error(f"❌ Failed to log request: {e}", exc_info=True)
 
-# --- Log incidents ---
-async def log_incident(ip: str, payload: str, rule: str):
-    try:
-        # Map rule to MITRE TTP
-        TTP_MAP = {
-            "Broken Access Control": "T1548",
-            "Cryptographic Failures": "T1600",
-            "Injection": "T1055",
-            "SQL Injection": "T1055",
-            "Insecure Design": "T1601",
-            "Security Misconfiguration": "T1547",
-            "Vulnerable and Outdated Components": "T1555",
-            "Identification and Authentication Failures": "T1078",
-            "Software and Data Integrity Failures": "T1553",
-            "Server-Side Request Forgery (SSRF)": "T1595",
-            "Logging and Monitoring Failures": "T1562",
-            "XSS": "T1059",
-            "Directory Traversal": "T1083",
-        }
-        ttp_id = TTP_MAP.get(rule, "T1190")
 
-        query = incidents_table.insert().values(
+async def log_ttp(incident_id: int, technique_id: str, technique_name: str, description: str):
+    """Logs a MITRE ATT&CK TTP related to a detected incident."""
+    try:
+        query = ttps_table.insert().values(
+            incident_id=incident_id,
+            technique_id=technique_id,
+            technique_name=technique_name,
+            description=description,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await database.execute(query)
+        logging.info(f"🧠 Logged TTP: {technique_id} - {technique_name}")
+    except Exception as e:
+        logging.error(f"❌ Failed to log TTP: {e}", exc_info=True)
+
+
+async def log_incident(ip: str, payload: str, rule: str):
+    """Logs a detected security incident and links it to a TTP if applicable."""
+    try:
+        insert_query = incidents_table.insert().values(
             ip=ip,
             payload=payload,
             rule_triggered=rule,
-            status="open",
-            ttp_id=ttp_id,
-            timestamp=datetime.now(timezone.utc)
-        )
-        await database.execute(query)
-        logging.info(f"🚨 Incident logged: {rule} (TTP: {ttp_id})")
-        await log_request(status='error', client_ip=ip)
+            timestamp=datetime.now(timezone.utc),
+        ).returning(incidents_table.c.id)
+
+        incident_id = await database.execute(insert_query)
+        logging.warning(f"🚨 Incident logged (ID={incident_id}) - Rule: {rule} from {ip}")
+
+        # --- Optional auto-linking to MITRE ATT&CK ---
+        if "SQL" in rule.upper():
+            await log_ttp(
+                incident_id=incident_id,
+                technique_id="T1190",
+                technique_name="Exploit Public-Facing Application",
+                description="SQL Injection attempt detected.",
+            )
+        elif "XSS" in rule.upper():
+            await log_ttp(
+                incident_id=incident_id,
+                technique_id="T1059.007",
+                technique_name="Cross-Site Scripting (XSS)",
+                description="Potential XSS attack via <script> payload.",
+            )
+
+        await log_request(status="error", client_ip=ip)
     except Exception as e:
         logging.error(f"❌ Failed to log incident: {e}", exc_info=True)
 
-# --- Fetch incidents ---
+
+# ------------------------------------------------------------
+# 📊 Query Functions
+# ------------------------------------------------------------
+
+async def get_api_usage():
+    """Aggregates API usage over 5-minute intervals."""
+    try:
+        query = text("""
+            SELECT
+                to_char(date_trunc('hour', timestamp) + floor(extract(minute from timestamp) / 5) * interval '5 minutes', 'HH24:MI') AS time,
+                COUNT(CASE WHEN status = 'success' THEN 1 END) AS success,
+                COUNT(CASE WHEN status = 'error' THEN 1 END) AS errors
+            FROM requests
+            WHERE timestamp > NOW() - INTERVAL '1 hour'
+            GROUP BY time
+            ORDER BY time;
+        """)
+        results = await database.fetch_all(query)
+
+        usage = []
+        for row in results:
+            row_dict = dict(row._mapping)
+            total = int(row_dict.get("success", 0)) + int(row_dict.get("errors", 0))
+            usage.append({
+                "time": row_dict["time"],
+                "rps": total,
+                "success": int(row_dict.get("success", 0)),
+                "errors": int(row_dict.get("errors", 0)),
+            })
+        return usage
+    except Exception as e:
+        logging.error(f"❌ Failed to fetch API usage: {e}", exc_info=True)
+        return []
+
+
 async def get_incidents():
+    """Returns the latest security incidents."""
     try:
         query = incidents_table.select().order_by(incidents_table.c.timestamp.desc()).limit(500)
         results = await database.fetch_all(query)
+
         incidents = [dict(row._mapping) for row in results]
         for inc in incidents:
             if isinstance(inc.get("timestamp"), datetime):
@@ -123,43 +220,30 @@ async def get_incidents():
         logging.error(f"❌ Failed to fetch incidents: {e}", exc_info=True)
         return []
 
-# --- Mark incident handled ---
-async def mark_incident_handled(incident_id: int):
+
+async def get_ttps():
+    """Returns logged MITRE ATT&CK TTPs."""
     try:
-        query = incidents_table.update().where(incidents_table.c.id == incident_id).values(status="resolved")
-        await database.execute(query)
-        logging.info(f"Marked incident {incident_id} as resolved")
+        query = ttps_table.select().order_by(ttps_table.c.timestamp.desc()).limit(500)
+        results = await database.fetch_all(query)
+
+        ttps = [dict(row._mapping) for row in results]
+        for ttp in ttps:
+            if isinstance(ttp.get("timestamp"), datetime):
+                ttp["timestamp"] = ttp["timestamp"].isoformat()
+        return ttps
+    except Exception as e:
+        logging.error(f"❌ Failed to fetch TTPs: {e}", exc_info=True)
+        return []
+
+
+async def mark_incident_handled(incident_id: int):
+    """Marks an incident as handled."""
+    try:
+        query = text("UPDATE incidents SET status = 'handled' WHERE id = :id")
+        await database.execute(query, values={"id": incident_id})
+        logging.info(f"✅ Incident {incident_id} marked as handled.")
         return True
     except Exception as e:
-        logging.error(f"❌ Failed to mark incident handled: {e}", exc_info=True)
+        logging.error(f"❌ Failed to mark incident as handled: {e}", exc_info=True)
         return False
-
-# --- Get API usage ---
-async def get_api_usage():
-    try:
-        query = """
-            SELECT
-                to_char(date_trunc('hour', timestamp) + floor(extract(minute from timestamp)/5)* interval '5 minutes','HH24:MI') as time,
-                COUNT(CASE WHEN status='success' THEN 1 END) as success,
-                COUNT(CASE WHEN status='error' THEN 1 END) as errors
-            FROM requests
-            WHERE timestamp > NOW() - INTERVAL '1 hour'
-            GROUP BY time
-            ORDER BY time;
-        """
-        results = await database.fetch_all(query)
-        usage_data = []
-        for row in results:
-            row_dict = dict(row._mapping)
-            success_count = int(row_dict.get('success', 0))
-            error_count = int(row_dict.get('errors', 0))
-            usage_data.append({
-                "time": row_dict['time'],
-                "rps": success_count + error_count,
-                "success": success_count,
-                "errors": error_count
-            })
-        return usage_data
-    except Exception as e:
-        logging.error(f"❌ Failed to fetch API usage: {e}", exc_info=True)
-        return []
