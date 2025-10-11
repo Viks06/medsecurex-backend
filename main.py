@@ -1,3 +1,4 @@
+import re
 import os
 import logging
 from datetime import datetime
@@ -8,27 +9,24 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+# Import your database and logging functions
 from incident_logger import (
     database,
     setup_database,
     log_incident,
     get_incidents,
+    mark_incident_handled,
     log_request,
     get_api_usage
 )
 from owasp_rules import OWASP_RULES
 from regex_rules import check_regex_rules
 
-# ----------------------------
-# Logging setup
-# ----------------------------
+# --- Logger setup ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# ----------------------------
-# FastAPI App
-# ----------------------------
-app = FastAPI(title="MEDSecureX API")
+# --- FastAPI app ---
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,72 +36,71 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# Startup / Shutdown
-# ----------------------------
+# --- Startup and shutdown ---
 @app.on_event("startup")
 async def startup():
     try:
         await database.connect()
-        logger.info("Connected to database.")
+        logging.info("Connected to database.")
         await setup_database()
     except Exception as e:
-        logger.exception("Startup error (DB): %s", e)
+        logging.exception("Startup error (DB): %s", e)
         raise
 
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
-    logger.info("Disconnected from database.")
 
-# ----------------------------
-# Admin key
-# ----------------------------
+# --- Admin auth ---
 ADMIN_KEY = os.getenv("ADMIN_KEY", "supersecretadminkey")
 
 def admin_auth(key: str):
     if key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ----------------------------
-# Middleware: Payload Inspection
-# ----------------------------
+# --- Middleware for payload inspection ---
 @app.middleware("http")
 async def payload_inspection_middleware(request: Request, call_next):
     path = request.url.path
+    logging.info(f"Middleware received request: {request.method} {path}")
+
+    # Skip internal endpoints
     if path.startswith(("/api/", "/admin", "/health")):
         return await call_next(request)
 
     client_ip = request.client.host if request.client else "unknown"
     full_payload = ""
+
     try:
         body_bytes = await request.body()
-        full_payload = body_bytes.decode("utf-8", errors="ignore") + request.url.query
-    except Exception:
+        payload_text = body_bytes.decode("utf-8", errors="ignore")
+        full_payload = payload_text + request.url.query
+    except Exception as e:
+        logging.error(f"Could not read request body: {e}", exc_info=True)
         full_payload = request.url.query
 
-    # OWASP Rules
+    # --- OWASP rules ---
     for rule_name, rule_fn in OWASP_RULES.items():
         if callable(rule_fn) and rule_fn(full_payload):
             await log_incident(client_ip, full_payload, rule_name)
             return JSONResponse(status_code=403, content={"detail": f"Blocked by WAF rule: {rule_name}"})
 
-    # Regex Rules
+    # --- Regex rules ---
     triggered_regex = check_regex_rules(full_payload)
     if triggered_regex:
         for r in triggered_regex:
             await log_incident(client_ip, full_payload, r)
         return JSONResponse(status_code=403, content={"detail": f"Blocked by Regex rule(s): {', '.join(triggered_regex)}"})
 
-    # Log success
-    await log_request(status="success", client_ip=client_ip)
+    # --- Success logging ---
+    await log_request(status='success', client_ip=client_ip)
 
+    # Proceed to endpoint
     response = await call_next(request)
     return response
 
-# ----------------------------
-# API Endpoints
-# ----------------------------
+# --- API Endpoints ---
+
 @app.get("/api/blocked-requests")
 async def blocked_requests():
     incidents = await get_incidents()
@@ -114,7 +111,7 @@ async def blocked_requests():
             minute = (dt.minute // 5) * 5
             time_key = f"{dt.hour:02d}:{minute:02d}"
             buckets[time_key] += 1
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             continue
     sorted_buckets = sorted(buckets.items())
     return [{"time": t, "blocked": c} for t, c in sorted_buckets]
@@ -126,28 +123,21 @@ async def api_usage():
 @app.get("/api/alerts")
 async def get_alerts_list():
     incidents_from_db = await get_incidents()
-    formatted_alerts = []
 
+    formatted_alerts = []
     for inc in incidents_from_db:
         rule = inc.get("rule_triggered") or inc.get("payload") or "Unknown"
-
         severity = "Medium"
-        if any(x in rule.upper() for x in ["SQL", "SQLI", "DROP"]):
+        if any(k in rule.upper() for k in ["SQL", "SQLI", "DROP"]):
             severity = "Critical"
-        elif any(x in rule.upper() for x in ["XSS", "<SCRIPT"]):
+        elif any(k in rule.upper() for k in ["XSS", "<SCRIPT"]):
             severity = "Critical"
-        elif any(x in rule.upper() for x in ["SSRF", "METADATA"]):
+        elif any(k in rule.upper() for k in ["SSRF", "METADATA"]):
             severity = "High"
 
-        status_map = {
-            "open": "New",
-            "new": "New",
-            "in_progress": "In Progress",
-            "inprogress": "In Progress",
-            "resolved": "Resolved",
-            "dismissed": "Dismissed"
-        }
         raw_status = (inc.get("status") or "open").lower()
+        status_map = {"open": "New", "new": "New", "in_progress": "In Progress",
+                      "inprogress": "In Progress", "resolved": "Resolved", "dismissed": "Dismissed"}
         ui_status = status_map.get(raw_status, "New")
 
         formatted_alerts.append({
@@ -162,8 +152,7 @@ async def get_alerts_list():
     return sorted_alerts
 
 @app.get("/api/ttps")
-async def get_ttps_endpoint():
-    # Just return unique TTPs from incidents
+async def api_ttps():
     incidents = await get_incidents()
     ttps = list({inc.get("ttp_id", "T1190") for inc in incidents})
     return {"ttps": ttps}
@@ -184,11 +173,16 @@ async def reset_db(key: str):
         async with database.transaction():
             await database.execute(text("DROP TABLE IF EXISTS requests;"))
             await database.execute(text("DROP TABLE IF EXISTS incidents;"))
-        return {"message": "Database tables dropped. Server will recreate them on next startup."}
+        return {"message": "Database tables dropped. Server will recreate them on restart."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Catch-all dummy endpoint
+# --- Catch-all endpoint ---
 @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def catch_all(request: Request, path_name: str):
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
+
+# --- Local run support ---
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
