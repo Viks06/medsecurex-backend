@@ -278,55 +278,6 @@ RULE_METADATA = {
         "ttp_id": "T1204"
     }
 }
-
-async def get_alerts(limit: int = 100):
-    """
-    Fetches and transforms recent incidents to match the MedSecureX Alerts UI template.
-    """
-    try:
-        # The query remains the same as it fetches the necessary base data
-        query = text("""
-            SELECT 
-                id, 
-                timestamp, 
-                ip, 
-                rule_triggered, 
-                status
-            FROM incidents
-            WHERE rule_triggered IS NOT NULL
-            ORDER BY timestamp DESC
-            LIMIT :limit;
-        """)
-        results = await database.fetch_all(query, values={"limit": limit})
-
-        alerts = []
-        for row in results:
-            data = dict(row._mapping)
-            rule_id = data.get("rule_triggered")
-            
-            # Get metadata for the rule, using the default if the rule is unknown
-            metadata = RULE_METADATA.get(rule_id, RULE_METADATA["default"])
-
-            # Format the status to be more readable (e.g., 'in_progress' -> 'In Progress')
-            status = data.get("status", "New").replace("_", " ").title()
-
-            alerts.append({
-                "id": f"SH-{data['id']}", # Prefixed ID to match UI examples
-                "timestamp": data["timestamp"].isoformat(),
-                "severity": metadata["severity"],
-                "description": f"{metadata['description']} from IP: {data['ip']}",
-                "ttp_id": metadata["ttp_id"],
-                "status": status,
-            })
-
-        return alerts
-        
-    except Exception as e:
-        logging.error(f"❌ Failed to fetch and transform alerts: {e}", exc_info=True)
-        # CRITICAL: Return an empty list on error to prevent frontend crashes
-        return []
-
-#alert's endpoint code ends
 async def mark_incident_handled(incident_id: int):
     """Marks an incident as handled."""
     try:
@@ -337,4 +288,5 @@ async def mark_incident_handled(incident_id: int):
     except Exception as e:
         logging.error(f"❌ Failed to mark incident as handled: {e}", exc_info=True)
         return False
+
 
