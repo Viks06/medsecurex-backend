@@ -227,53 +227,69 @@ async def get_ttp_data(limit: int = 100):
 
 
 #Alert's table endpoint
+@app.get("/api/blocked-requests")
+async def blocked_requests():
+	incidents = await get_incidents()
+	buckets = defaultdict(int)
+	for inc in incidents:
+		try:
+			dt = datetime.fromisoformat(inc["timestamp"])
+			minute = (dt.minute // 5) * 5
+			time_key = f"{dt.hour:02d}:{minute:02d}"
+			buckets[time_key] += 1
+		except (ValueError, KeyError, TypeError):
+			continue
+	sorted_buckets = sorted(buckets.items())
+	return [{"time": t, "blocked": c} for t, c in sorted_buckets]
+
+@app.get("/api/api-usage")
+async def api_usage():
+	return await get_api_usage()
+
 @app.get("/api/alerts")
-async def get_alerts(limit: int = 100):
-    """
-    Fetches and transforms recent incidents to match the MedSecureX Alerts UI template.
-    """
-    try:
-        # IMPORTANT: Added 'status' to the SELECT statement
-        query = text("""
-            SELECT 
-                id, 
-                timestamp, 
-                ip, 
-                rule_triggered, 
-                status
-            FROM incidents
-            WHERE rule_triggered IS NOT NULL
-            ORDER BY timestamp DESC
-            LIMIT :limit;
-        """)
-        results = await database.fetch_all(query, values={"limit": limit})
+async def get_alerts_list():
+    incidents_from_db = await get_incidents()
 
-        alerts = []
-        for row in results:
-            data = dict(row._mapping)
-            rule_id = data.get("rule_triggered")
-            
-            # Get metadata for the rule, using the default if the rule is unknown
-            metadata = RULE_METADATA.get(rule_id, RULE_METADATA["default"])
+    formatted_alerts = []
+    for inc in incidents_from_db:
+        # ensure safe access
+        rule = inc.get("rule_triggered") or inc.get("payload") or "Unknown"
+        # basic severity heuristic — adjust to your rules
+        severity = "Medium"
+        if "SQL" in rule.upper() or "SQLI" in rule.upper() or "DROP" in rule.upper():
+            severity = "Critical"
+        elif "XSS" in rule.upper() or "<SCRIPT" in rule.upper():
+            severity = "Critical"
+        elif "SSRF" in rule.upper() or "METADATA" in rule.upper():
+            severity = "High"
 
-            # Format the status to be more readable (e.g., 'in_progress' -> 'In Progress')
-            status = data.get("status", "New").replace("_", " ").title()
+        # map DB status -> UI status names
+        raw_status = (inc.get("status") or "open").lower()
+        status_map = {
+            "open": "New",
+            "new": "New",
+            "in_progress": "In Progress",
+            "inprogress": "In Progress",
+            "resolved": "Resolved",
+            "dismissed": "Dismissed"
+        }
+        ui_status = status_map.get(raw_status, "New")
 
-            alerts.append({
-                "id": f"SH-{data['id']}", # Prefixed ID to match UI
-                "timestamp": data["timestamp"].isoformat(),
-                "severity": metadata["severity"],
-                "description": f"{metadata['description']} from IP: {data['ip']}",
-                "ttp_id": metadata["ttp_id"],
-                "status": status,
-            })
+        formatted_alerts.append({
+            "description": rule,
+            "ttp_id": inc.get("mitre", "T1190"),
+            "severity": severity,
+            "status": ui_status,
+            "timestamp": inc.get("timestamp"),
+        })
 
-        return alerts
-        
-    except Exception as e:
-        logging.error(f"❌ Failed to fetch and transform alerts: {e}", exc_info=True)
-        # CRITICAL FIX: Return an empty list on error to prevent the frontend crash
-        return []
+    # stable sort by timestamp (fallback to empty string)
+    sorted_alerts = sorted(
+        formatted_alerts,
+        key=lambda x: x.get("timestamp") or "",
+        reverse=True
+    )
+    return sorted_alerts
 
 # ... (add your other endpoints here)
 
@@ -287,6 +303,7 @@ async def get_alerts(limit: int = 100):
 async def catch_all(request: Request, path_name: str):
     """Handles non-API routes safely."""
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
+
 
 
 
