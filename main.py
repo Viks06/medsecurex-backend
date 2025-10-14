@@ -225,6 +225,48 @@ async def get_ttp_data(limit: int = 100):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
+#Alert's table endpoint
+@app.get("/api/alerts")
+async def get_alerts(limit: int = 50):
+    """Return recent alerts (blocked requests/incidents)."""
+    try:
+        query = """
+            SELECT 
+                id, 
+                timestamp, 
+                ip, 
+                payload, 
+                rule_triggered 
+            FROM incidents 
+            WHERE rule_triggered IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT :limit;
+        """
+        results = await database.fetch_all(query, values={"limit": limit})
+
+        alerts = []
+        for row in results:
+            data = dict(row._mapping)
+            alerts.append({
+                "id": data["id"],
+                "timestamp": (
+                    data["timestamp"].isoformat()
+                    if isinstance(data["timestamp"], datetime)
+                    else data["timestamp"]
+                ),
+                "ip": data["ip"],
+                "payload": data["payload"][:200] + "..." if data["payload"] and len(data["payload"]) > 200 else data["payload"],
+                "rule_triggered": data["rule_triggered"],
+                "status": "blocked"
+            })
+
+        return alerts
+    except Exception as e:
+        logging.error(f"❌ Could not fetch alerts data: {e}", exc_info=True)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+
 # ==============================================================
 # 🧩 FALLBACK ROUTE
 # ==============================================================
@@ -233,3 +275,4 @@ async def get_ttp_data(limit: int = 100):
 async def catch_all(request: Request, path_name: str):
     """Handles non-API routes safely."""
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
+
