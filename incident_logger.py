@@ -236,7 +236,97 @@ async def get_ttps():
         logging.error(f"❌ Failed to fetch TTPs: {e}", exc_info=True)
         return []
 
+#alert's endpoint code
+import logging
+from datetime import datetime
+from sqlalchemy import text
+from app.db import database # Assuming 'database' is your database connection instance
 
+# --- Define Metadata for Security Rules ---
+# This dictionary maps the 'rule_triggered' from your database to the rich
+# information needed by the frontend UI.
+RULE_METADATA = {
+    "ransomware_behavior": {
+        "severity": "Critical",
+        "description": "Ransomware behavior detected on an endpoint",
+        "ttp_id": "T1486"
+    },
+    "c2_outbound": {
+        "severity": "High",
+        "description": "Unusual outbound traffic to known C2 server",
+        "ttp_id": "T1071.001"
+    },
+    "suspicious_task_creation": {
+        "severity": "Medium",
+        "description": "Suspicious scheduled task creation",
+        "ttp_id": "T1053.005"
+    },
+    "sensitive_group_add": {
+        "severity": "Low",
+        "description": "User added to sensitive security group",
+        "ttp_id": "T1098"
+    },
+    "sql_injection": {
+        "severity": "Critical",
+        "description": "SQL Injection attempt detected",
+        "ttp_id": "T1190"
+    },
+    # Fallback for any rule not explicitly defined above
+    "default": {
+        "severity": "Medium",
+        "description": "A generic security alert was triggered",
+        "ttp_id": "T1204"
+    }
+}
+
+async def get_alerts(limit: int = 100):
+    """
+    Fetches and transforms recent incidents to match the MedSecureX Alerts UI template.
+    """
+    try:
+        # The query remains the same as it fetches the necessary base data
+        query = text("""
+            SELECT 
+                id, 
+                timestamp, 
+                ip, 
+                rule_triggered, 
+                status
+            FROM incidents
+            WHERE rule_triggered IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT :limit;
+        """)
+        results = await database.fetch_all(query, values={"limit": limit})
+
+        alerts = []
+        for row in results:
+            data = dict(row._mapping)
+            rule_id = data.get("rule_triggered")
+            
+            # Get metadata for the rule, using the default if the rule is unknown
+            metadata = RULE_METADATA.get(rule_id, RULE_METADATA["default"])
+
+            # Format the status to be more readable (e.g., 'in_progress' -> 'In Progress')
+            status = data.get("status", "New").replace("_", " ").title()
+
+            alerts.append({
+                "id": f"SH-{data['id']}", # Prefixed ID to match UI examples
+                "timestamp": data["timestamp"].isoformat(),
+                "severity": metadata["severity"],
+                "description": f"{metadata['description']} from IP: {data['ip']}",
+                "ttp_id": metadata["ttp_id"],
+                "status": status,
+            })
+
+        return alerts
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to fetch and transform alerts: {e}", exc_info=True)
+        # CRITICAL: Return an empty list on error to prevent frontend crashes
+        return []
+
+#alert's endpoint code ends
 async def mark_incident_handled(incident_id: int):
     """Marks an incident as handled."""
     try:
@@ -247,3 +337,4 @@ async def mark_incident_handled(incident_id: int):
     except Exception as e:
         logging.error(f"❌ Failed to mark incident as handled: {e}", exc_info=True)
         return False
+
