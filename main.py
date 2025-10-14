@@ -227,43 +227,54 @@ async def get_ttp_data(limit: int = 100):
 
 #Alert's table endpoint
 @app.get("/api/alerts")
-async def get_alerts(limit: int = 50):
-    """Return recent alerts (blocked requests/incidents)."""
+async def get_alerts(limit: int = 100):
+    """
+    Fetches and transforms recent incidents to match the MedSecureX Alerts UI template.
+    """
     try:
-        query = """
+        # IMPORTANT: Added 'status' to the SELECT statement
+        query = text("""
             SELECT 
                 id, 
                 timestamp, 
                 ip, 
-                payload, 
-                rule_triggered 
-            FROM incidents 
+                rule_triggered, 
+                status
+            FROM incidents
             WHERE rule_triggered IS NOT NULL
             ORDER BY timestamp DESC
             LIMIT :limit;
-        """
+        """)
         results = await database.fetch_all(query, values={"limit": limit})
 
         alerts = []
         for row in results:
             data = dict(row._mapping)
+            rule_id = data.get("rule_triggered")
+            
+            # Get metadata for the rule, using the default if the rule is unknown
+            metadata = RULE_METADATA.get(rule_id, RULE_METADATA["default"])
+
+            # Format the status to be more readable (e.g., 'in_progress' -> 'In Progress')
+            status = data.get("status", "New").replace("_", " ").title()
+
             alerts.append({
-                "id": data["id"],
-                "timestamp": (
-                    data["timestamp"].isoformat()
-                    if isinstance(data["timestamp"], datetime)
-                    else data["timestamp"]
-                ),
-                "ip": data["ip"],
-                "payload": data["payload"][:200] + "..." if data["payload"] and len(data["payload"]) > 200 else data["payload"],
-                "rule_triggered": data["rule_triggered"],
-                "status": "blocked"
+                "id": f"SH-{data['id']}", # Prefixed ID to match UI
+                "timestamp": data["timestamp"].isoformat(),
+                "severity": metadata["severity"],
+                "description": f"{metadata['description']} from IP: {data['ip']}",
+                "ttp_id": metadata["ttp_id"],
+                "status": status,
             })
 
         return alerts
+        
     except Exception as e:
-        logging.error(f"❌ Could not fetch alerts data: {e}", exc_info=True)
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        logging.error(f"❌ Failed to fetch and transform alerts: {e}", exc_info=True)
+        # CRITICAL FIX: Return an empty list on error to prevent the frontend crash
+        return []
+
+# ... (add your other endpoints here)
 
 
 
@@ -275,4 +286,5 @@ async def get_alerts(limit: int = 50):
 async def catch_all(request: Request, path_name: str):
     """Handles non-API routes safely."""
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
+
 
