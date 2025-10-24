@@ -240,7 +240,7 @@ async def get_ttps():
 import logging
 from datetime import datetime
 from sqlalchemy import text
-from app.db import database # Assuming 'database' is your database connection instance
+#from app.db import database                      -----------deepak changed # Assuming 'database' is your database connection instance
 
 # --- Define Metadata for Security Rules ---
 # This dictionary maps the 'rule_triggered' from your database to the rich
@@ -288,5 +288,6 @@ async def mark_incident_handled(incident_id: int):
     except Exception as e:
         logging.error(f"❌ Failed to mark incident as handled: {e}", exc_info=True)
         return False
+
 
 
