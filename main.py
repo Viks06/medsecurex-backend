@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="MedSecureX Backend", version="2.0")
-from app.db import database
+#from app.db import database-----------deepak chnaged
 
 app.add_middleware(
     CORSMiddleware,
@@ -303,6 +303,7 @@ async def get_alerts_list():
 async def catch_all(request: Request, path_name: str):
     """Handles non-API routes safely."""
     return {"message": "Request processed successfully.", "path": f"/{path_name}"}
+
 
 
 
